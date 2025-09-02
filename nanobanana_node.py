@@ -1,10 +1,10 @@
 import os
 import io
 import json
-import base64  # ¡FALTABA ESTE IMPORT!
+import base64
 import torch
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 import requests
 import traceback
 
@@ -13,18 +13,20 @@ class NanoBananaImageGenerator:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "prompt": ("STRING", {"multiline": True, "default": "a cute cat, high quality, 4k"}),
+                "prompt": ("STRING", {"multiline": True}),
                 "api_key": ("STRING", {"default": "", "multiline": False}),
-                "model": (["sdxl-turbo", "stable-diffusion-2.1"], {"default": "sdxl-turbo"}),
-                "width": ("INT", {"default": 512, "min": 256, "max": 2048, "step": 64}),
-                "height": ("INT", {"default": 512, "min": 256, "max": 2048, "step": 64}),
-                "steps": ("INT", {"default": 4, "min": 1, "max": 50}),
-                "cfg_scale": ("FLOAT", {"default": 1.5, "min": 0.0, "max": 20.0, "step": 0.1}),
+                "model": (["models/gemini-2.0-flash-preview-image-generation", "models/gemini-2.0-flash-exp", "models/gemini-2.5-flash-image-preview"], {"default": "models/gemini-2.5-flash-image-preview"}),
+                "aspect_ratio": ([
+                    "Free (自由比例)",
+                    "Landscape (横屏)",
+                    "Portrait (竖屏)",
+                    "Square (方形)",
+                ], {"default": "Free (自由比例)"}),
+                "temperature": ("FLOAT", {"default": 1, "min": 0.0, "max": 2.0, "step": 0.05}),
             },
             "optional": {
-                "seed": ("INT", {"default": 0, "min": 0, "max": 2147483647}),
-                "negative_prompt": ("STRING", {"multiline": True, "default": "ugly, bad art, deformed"}),
-                "aspect_ratio": (["1:1", "4:3", "3:4", "16:9", "9:16"], {"default": "1:1"}),
+                "seed": ("INT", {"default": 66666666, "min": 0, "max": 2147483647}),
+                "images": ("IMAGE",),
             }
         }
 
@@ -77,10 +79,31 @@ class NanoBananaImageGenerator:
         self.log(f"Creating ComfyUI-compatible empty image: Shape={tensor.shape}, Type={tensor.dtype}")
         return tensor
 
-    def generate_image(self, prompt, api_key, model, width, height, steps, cfg_scale, seed=0, negative_prompt="", aspect_ratio="1:1"):
+    def determine_dimensions_from_aspect_ratio(self, aspect_ratio):
+        """Determina las dimensiones basadas en el aspect ratio seleccionado."""
+        if "Free" in aspect_ratio:
+            # Dimensiones libres, usa valores por defecto
+            return 1024, 1024
+        elif "Landscape" in aspect_ratio:
+            # Horizontal - más ancho que alto
+            return 1344, 768
+        elif "Portrait" in aspect_ratio:
+            # Vertical - más alto que ancho  
+            return 768, 1344
+        elif "Square" in aspect_ratio:
+            # Cuadrado
+            return 1024, 1024
+        else:
+            # Por defecto
+            return 1024, 1024
+
+    def generate_image(self, prompt, api_key, model, aspect_ratio, temperature, seed=66666666, images=None):
         self.log_messages = []  # Reset logs for each run
         response_text = ""
-        generated_image_tensor = self.generate_empty_image(width, height)  # Default to empty image
+        
+        # Determinar dimensiones basadas en aspect_ratio
+        width, height = self.determine_dimensions_from_aspect_ratio(aspect_ratio)
+        generated_image_tensor = self.generate_empty_image(width, height)
 
         try:
             actual_api_key = self.get_api_key(api_key)
@@ -97,105 +120,112 @@ class NanoBananaImageGenerator:
                 self.log(f"Generated random seed: {seed}")
             else:
                 self.log(f"Using specified seed: {seed}")
-            
-            # Handle aspect ratio - adjust width/height based on aspect ratio
-            if aspect_ratio == "4:3":
-                width = int(height * 4 / 3)
-            elif aspect_ratio == "3:4":
-                height = int(width * 4 / 3)
-            elif aspect_ratio == "16:9":
-                width = int(height * 16 / 9)
-            elif aspect_ratio == "9:16":
-                height = int(width * 16 / 9)
-            # 1:1 keeps original width/height
-            
-            self.log(f"Final dimensions: {width}x{height} (aspect ratio: {aspect_ratio})")
 
-            # CAMBIO IMPORTANTE: En lugar de fallar, devuelve una imagen de prueba
-            # Reemplaza esta URL con el endpoint real de NanoBanana cuando lo tengas
-            api_endpoint = "https://api.nanobanana.com/generate"  # URL de ejemplo
+            self.log(f"Using dimensions: {width}x{height} for aspect ratio: {aspect_ratio}")
+            self.log(f"Temperature: {temperature}, Model: {model}")
+
+            # ENDPOINT PLACEHOLDER - Reemplaza con la URL real de NanoBanana
+            api_endpoint = "https://api.nanobanana.com/v1/generate"  # URL de ejemplo
             
             # Si no tienes el endpoint real aún, genera una imagen de prueba
-            if "example" in api_endpoint or "YOUR_" in api_endpoint:
-                self.log("WARNING: Using placeholder API endpoint. Generating test image.")
-                # Crear una imagen de prueba con texto
-                from PIL import ImageDraw, ImageFont
+            if "example" in api_endpoint or not actual_api_key.startswith("nb-"):  # Asumiendo que las keys de NanoBanana empiezan con "nb-"
+                self.log("WARNING: Using placeholder API endpoint or test key. Generating test image.")
+                
+                # Crear una imagen de prueba con información del prompt
                 test_img = Image.new('RGB', (width, height), color='lightblue')
                 draw = ImageDraw.Draw(test_img)
                 
-                # Texto de prueba
-                test_text = f"Test Image\n{prompt[:50]}..."
+                # Texto de prueba con información de parámetros
+                test_text = f"NanoBanana Test Image\n\nPrompt: {prompt[:100]}...\nModel: {model}\nAspect: {aspect_ratio}\nTemp: {temperature}\nSeed: {seed}"
+                
                 try:
-                    # Intenta usar una fuente por defecto
                     font = ImageFont.load_default()
                 except:
                     font = None
                 
-                draw.text((10, 10), test_text, fill='black', font=font)
+                # Dividir texto en líneas para mejor presentación
+                lines = test_text.split('\n')
+                y_pos = 20
+                for line in lines:
+                    draw.text((20, y_pos), line, fill='black', font=font)
+                    y_pos += 30
                 
                 # Convertir a tensor
                 img_array = np.array(test_img).astype(np.float32) / 255.0
                 generated_image_tensor = torch.from_numpy(img_array).unsqueeze(0)
-                response_text = f"Test image generated (API endpoint not configured)\nPrompt: {prompt}"
+                response_text = f"Test image generated (API endpoint not configured)\nDimensions: {width}x{height}\nPrompt: {prompt}"
                 self.log("Test image created successfully")
                 
             else:
-                # Código real de API cuando tengas el endpoint
+                # Código real de API cuando tengas el endpoint configurado
                 headers = {
                     "Authorization": f"Bearer {actual_api_key}",
                     "Content-Type": "application/json"
                 }
 
+                # Adapta este payload según la documentación real de NanoBanana
                 payload = {
                     "prompt": prompt,
-                    "negative_prompt": negative_prompt,
                     "model": model,
+                    "aspect_ratio": aspect_ratio,
+                    "temperature": temperature,
+                    "seed": seed,
                     "width": width,
                     "height": height,
-                    "num_inference_steps": steps,
-                    "guidance_scale": cfg_scale,
-                    "seed": seed,
-                    "output_format": "jpeg",
                 }
-                
-                self.log(f"Sending request to NanoBanana API with payload: {json.dumps(payload, indent=2)}")
 
-                # Make the API call
-                api_response = requests.post(api_endpoint, headers=headers, json=payload, timeout=30)
+                # Si hay imágenes de referencia, procesarlas
+                if images is not None:
+                    try:
+                        # Procesar imágenes de referencia (similar al ejemplo de Gemini)
+                        reference_images = []
+                        batch_size = images.shape[0]
+                        self.log(f"Processing {batch_size} reference images")
+                        
+                        for i in range(batch_size):
+                            input_image = images[i].cpu().numpy()
+                            input_image = (input_image * 255).astype(np.uint8)
+                            pil_image = Image.fromarray(input_image)
+                            
+                            # Convertir a base64 para enviar en la API
+                            img_byte_arr = io.BytesIO()
+                            pil_image.save(img_byte_arr, format='PNG')
+                            img_byte_arr.seek(0)
+                            img_b64 = base64.b64encode(img_byte_arr.read()).decode('utf-8')
+                            reference_images.append(img_b64)
+                            
+                        payload["reference_images"] = reference_images
+                        self.log(f"Added {len(reference_images)} reference images to request")
+                        
+                    except Exception as img_error:
+                        self.log(f"Reference image processing error: {str(img_error)}")
+                
+                self.log(f"Sending request to NanoBanana API")
+
+                # Realizar la llamada a la API
+                api_response = requests.post(api_endpoint, headers=headers, json=payload, timeout=60)
                 api_response.raise_for_status()
                 self.log(f"API Response Status: {api_response.status_code}")
 
                 response_data = api_response.json()
                 
-                # Procesar respuesta (adapta según la API real)
-                image_b64 = None
-                if "image_base64" in response_data:
-                    image_b64 = response_data["image_base64"]
-                    response_text += "Image data received successfully.\n"
-                elif "output" in response_data and isinstance(response_data["output"], list):
-                    if len(response_data["output"]) > 0:
-                        if "base64" in response_data["output"][0]:
-                            image_b64 = response_data["output"][0]["base64"]
-                            response_text += "Image data received from 'output' field.\n"
-                        elif "url" in response_data["output"][0]:
-                            image_url = response_data["output"][0]["url"]
-                            self.log(f"Image URL received: {image_url}. Downloading image...")
-                            image_response = requests.get(image_url, timeout=30)
-                            image_response.raise_for_status()
-                            image_data = image_response.content
-                            self.log(f"Downloaded image: {len(image_data)} bytes.")
-                            pil_image = Image.open(io.BytesIO(image_data))
-                            if pil_image.mode != 'RGB':
-                                pil_image = pil_image.convert('RGB')
-                            img_array = np.array(pil_image).astype(np.float32) / 255.0
-                            generated_image_tensor = torch.from_numpy(img_array).unsqueeze(0)
-                            response_text += f"Image downloaded from URL: {image_url}\n"
-                            self.log(f"Image converted to tensor, shape: {generated_image_tensor.shape}")
+                # Procesar respuesta (adapta según la respuesta real de NanoBanana)
+                image_data = None
+                if "image" in response_data:
+                    if "base64" in response_data["image"]:
+                        image_data = base64.b64decode(response_data["image"]["base64"])
+                        response_text += "Image data received successfully.\n"
+                    elif "url" in response_data["image"]:
+                        image_url = response_data["image"]["url"]
+                        self.log(f"Image URL received: {image_url}. Downloading image...")
+                        image_response = requests.get(image_url, timeout=30)
+                        image_response.raise_for_status()
+                        image_data = image_response.content
+                        response_text += f"Image downloaded from URL: {image_url}\n"
 
-                if image_b64:
-                    image_data = base64.b64decode(image_b64)
+                if image_data:
                     pil_image = Image.open(io.BytesIO(image_data))
-                    self.log(f"Successfully opened image: {pil_image.width}x{pil_image.height}, format: {pil_image.format}")
+                    self.log(f"Successfully opened image: {pil_image.width}x{pil_image.height}")
 
                     if pil_image.mode != 'RGB':
                         pil_image = pil_image.convert('RGB')
@@ -204,14 +234,18 @@ class NanoBananaImageGenerator:
                     generated_image_tensor = torch.from_numpy(img_array).unsqueeze(0)
                     self.log(f"Image converted to tensor successfully, shape: {generated_image_tensor.shape}")
                 else:
-                    self.log("No base64 image data or URL found in the API response.")
+                    self.log("No image data found in the API response.")
                     response_text += "No image data found in response.\n"
 
         except requests.exceptions.RequestException as req_err:
             error_message = f"API Request Error: {req_err}"
             self.log(error_message)
             if hasattr(req_err, 'response') and req_err.response is not None:
-                self.log(f"API Response Content: {req_err.response.text}")
+                try:
+                    error_detail = req_err.response.text
+                    self.log(f"API Error Response: {error_detail}")
+                except:
+                    pass
             response_text += f"Request failed: {req_err}\n"
         except json.JSONDecodeError as json_err:
             error_message = f"JSON Decode Error: {json_err}"
