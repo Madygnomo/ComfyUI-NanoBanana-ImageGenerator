@@ -1,0 +1,4 @@
+venv/
+*.pyc
+__pycache__/
+nanobanana_api_key.txt  # ¡IMPORTANTE! NUNCA subas tu clave API a GitHub.
