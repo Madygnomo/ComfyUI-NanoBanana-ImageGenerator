@@ -13,20 +13,18 @@ class NanoBananaImageGenerator:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "prompt": ("STRING", {"multiline": True}),
+                "prompt": ("STRING", {"multiline": True, "default": "a cute cat, high quality, 4k"}),
                 "api_key": ("STRING", {"default": "", "multiline": False}),
-                "model": (["models/gemini-2.5-flash-image-preview"], {"default": "models/gemini-2.5-flash-image-preview"}),
-                "aspect_ratio": ([
-                    "Free (自由比例)",
-                    "Landscape (横屏)",
-                    "Portrait (竖屏)",
-                    "Square (方形)",
-                ], {"default": "Free (自由比例)"}),
-                "temperature": ("FLOAT", {"default": 1, "min": 0.0, "max": 2.0, "step": 0.05}),
+                "model": (["sdxl-turbo", "stable-diffusion-2.1"], {"default": "sdxl-turbo"}),
+                "width": ("INT", {"default": 512, "min": 256, "max": 2048, "step": 64}),
+                "height": ("INT", {"default": 512, "min": 256, "max": 2048, "step": 64}),
+                "steps": ("INT", {"default": 4, "min": 1, "max": 50}),
+                "cfg_scale": ("FLOAT", {"default": 1.5, "min": 0.0, "max": 20.0, "step": 0.1}),
             },
             "optional": {
-                "seed": ("INT", {"default": 66666666, "min": 0, "max": 2147483647}),
-                "images": ("IMAGE",),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 2147483647}),
+                "negative_prompt": ("STRING", {"multiline": True, "default": "ugly, bad art, deformed"}),
+                "aspect_ratio": (["1:1", "4:3", "3:4", "16:9", "9:16"], {"default": "1:1"}),
             }
         }
 
@@ -79,7 +77,7 @@ class NanoBananaImageGenerator:
         self.log(f"Creating ComfyUI-compatible empty image: Shape={tensor.shape}, Type={tensor.dtype}")
         return tensor
 
-    def generate_image(self, prompt, api_key, model, width, height, steps, cfg_scale, seed=0, negative_prompt=""):
+    def generate_image(self, prompt, api_key, model, width, height, steps, cfg_scale, seed=0, negative_prompt="", aspect_ratio="1:1"):
         self.log_messages = []  # Reset logs for each run
         response_text = ""
         generated_image_tensor = self.generate_empty_image(width, height)  # Default to empty image
@@ -99,6 +97,19 @@ class NanoBananaImageGenerator:
                 self.log(f"Generated random seed: {seed}")
             else:
                 self.log(f"Using specified seed: {seed}")
+            
+            # Handle aspect ratio - adjust width/height based on aspect ratio
+            if aspect_ratio == "4:3":
+                width = int(height * 4 / 3)
+            elif aspect_ratio == "3:4":
+                height = int(width * 4 / 3)
+            elif aspect_ratio == "16:9":
+                width = int(height * 16 / 9)
+            elif aspect_ratio == "9:16":
+                height = int(width * 16 / 9)
+            # 1:1 keeps original width/height
+            
+            self.log(f"Final dimensions: {width}x{height} (aspect ratio: {aspect_ratio})")
 
             # CAMBIO IMPORTANTE: En lugar de fallar, devuelve una imagen de prueba
             # Reemplaza esta URL con el endpoint real de NanoBanana cuando lo tengas
