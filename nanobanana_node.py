@@ -2,177 +2,272 @@ import os
 import base64
 import io
 import json
-import torch
-import numpy as np
-from PIL import Image
-import requests
+import mimetypes
+import traceback
 from io import BytesIO
+
+import numpy as np
+import torch
+from PIL import Image
+
 from google import genai
 from google.genai import types
-import traceback
 
-class NanoBananaImageGenerator:
+
+# --- Persistencia de API key (estilo ComfyUI) ---
+NODE_DIR = os.path.dirname(os.path.abspath(__file__))
+KEY_FILE = os.path.join(NODE_DIR, "gemini_api_key.txt")
+
+
+def _save_api_key_to_file(api_key: str, logs: list):
+    try:
+        with open(KEY_FILE, "w", encoding="utf-8") as f:
+            f.write(api_key.strip())
+        logs.append(f"[INFO] API key guardada en: {KEY_FILE}")
+    except Exception as e:
+        logs.append(f"[WARN] No se pudo guardar la API key: {e}")
+
+
+def _load_api_key_from_file(logs: list) -> str:
+    try:
+        if os.path.exists(KEY_FILE):
+            with open(KEY_FILE, "r", encoding="utf-8") as f:
+                key = f.read().strip()
+                if key:
+                    logs.append("[INFO] API key cargada desde archivo persistente")
+                    return key
+    except Exception as e:
+        logs.append(f"[WARN] No se pudo leer {KEY_FILE}: {e}")
+    return ""
+
+
+def _resolve_api_key(user_input_key: str, logs: list) -> str:
+    """
+    Prioridad:
+      1) api_key desde UI (y se guarda)
+      2) KEY_FILE
+      3) var de entorno GEMINI_API_KEY
+    """
+    if user_input_key and len(user_input_key.strip()) > 10:
+        logs.append("[INFO] Usando API key provista por UI")
+        _save_api_key_to_file(user_input_key.strip(), logs)
+        return user_input_key.strip()
+
+    file_key = _load_api_key_from_file(logs)
+    if file_key and len(file_key) > 10:
+        return file_key
+
+    env_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if env_key and len(env_key) > 10:
+        logs.append("[INFO] Usando API key desde GEMINI_API_KEY")
+        return env_key
+
+    return ""
+
+
+def _tensor_from_pil(pil_img: Image.Image, logs: list) -> torch.Tensor:
+    if pil_img.mode != "RGB":
+        pil_img = pil_img.convert("RGB")
+    arr = np.array(pil_img).astype(np.float32) / 255.0  # HWC [0..1]
+    tensor = torch.from_numpy(arr).unsqueeze(0)  # [1, H, W, 3]
+    logs.append(f"[INFO] Imagen convertida a tensor: shape={tuple(tensor.shape)}, dtype={tensor.dtype}")
+    return tensor
+
+
+def _bytes_from_inline_data(inline_data, logs: list) -> bytes:
+    """
+    Convierte inline_data.data a bytes:
+      - Si es str: se asume base64 y se decodifica.
+      - Si ya es bytes: se devuelve tal cual.
+    """
+    data = getattr(inline_data, "data", None)
+    if data is None:
+        raise ValueError("inline_data.data está vacío")
+
+    if isinstance(data, bytes):
+        logs.append(f"[INFO] inline_data.data recibido como bytes (len={len(data)})")
+        return data
+
+    if isinstance(data, str):
+        try:
+            decoded = base64.b64decode(data)
+            logs.append(f"[INFO] inline_data.data decodificado desde base64 (len={len(decoded)})")
+            return decoded
+        except Exception as e:
+            raise ValueError(f"No se pudo decodificar base64: {e}")
+
+    raise TypeError(f"Tipo inesperado en inline_data.data: {type(data)}")
+
+
+def _hint_from_aspect_ratio(ar: str) -> str:
+    if "Landscape" in ar:
+        return "Generate as a wide rectangular image (width > height)."
+    if "Portrait" in ar:
+        return "Generate as a tall rectangular image (height > width)."
+    if "Square" in ar:
+        return "Generate as a square image (width = height)."
+    return ""  # Free
+
+
+class GeminiImageGenerator:
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
                 "prompt": ("STRING", {"multiline": True}),
                 "api_key": ("STRING", {"default": "", "multiline": False}),
-                "model": ([
-                    "models/gemini-2.5-flash-image-preview",
-                    "models/gemini-2.0-flash-preview-image-generation",
-                    "models/gemini-2.0-flash-exp"
-                ], {"default": "models/gemini-2.5-flash-image-preview"}),
-                "aspect_ratio": ([
-                    "Free",
-                    "Landscape",
-                    "Portrait",
-                    "Square"
-                ], {"default": "Free"})
+                "model": (
+                    [
+                        "models/gemini-2.0-flash-preview-image-generation",
+                        "models/gemini-2.0-flash-exp",
+                        "models/gemini-2.5-flash-image-preview",
+                    ],
+                    {"default": "models/gemini-2.5-flash-image-preview"},
+                ),
+                "aspect_ratio": (
+                    [
+                        "Free (自由比例)",
+                        "Landscape (横屏)",
+                        "Portrait (竖屏)",
+                        "Square (方形)",
+                    ],
+                    {"default": "Free (自由比例)"},
+                ),
+                "temperature": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}),
             },
             "optional": {
-                "seed": ("INT", {"default": 0, "min": 0, "max": 4294967295}),
+                "seed": ("INT", {"default": 66666666, "min": 0, "max": 2147483647}),
                 "images": ("IMAGE",),
-            }
+            },
         }
 
     RETURN_TYPES = ("IMAGE", "STRING")
-    RETURN_NAMES = ("image", "API Response Log")
+    RETURN_NAMES = ("image", "API Respond")
     FUNCTION = "generate_image"
-    CATEGORY = "NanoBanana"
+    CATEGORY = "Google-Gemini"
 
     def __init__(self):
-        self.log_messages = []
-        self.node_dir = os.path.dirname(os.path.abspath(__file__))
-        self.key_file = os.path.join(self.node_dir, "nanobanana_api_key.txt")
+        self.logs = []
 
-    def log(self, message):
-        """Global logging function: records messages to a list."""
-        if hasattr(self, 'log_messages'):
-            self.log_messages.append(message)
-        print(f"[NanoBanana] {message}")  # También imprime en consola para debug
-        return message
+    def _log(self, msg: str):
+        self.logs.append(msg)
+        return msg
 
-    def get_api_key(self, user_input_key):
-        """Fetches API key, prioritizing user input."""
-        if user_input_key and len(user_input_key) > 10:
-            self.log("Using user-provided API key.")
-            try:
-                with open(self.key_file, "w") as f:
-                    f.write(user_input_key)
-                self.log("API key saved to node directory.")
-            except Exception as e:
-                self.log(f"Failed to save API key: {e}")
-            return user_input_key
+    def _reset_logs(self):
+        self.logs = []
 
-        if os.path.exists(self.key_file):
-            try:
-                with open(self.key_file, "r") as f:
-                    saved_key = f.read().strip()
-                if saved_key and len(saved_key) > 10:
-                    self.log("Using saved API key.")
-                    return saved_key
-            except Exception as e:
-                self.log(f"Failed to read saved API key: {e}")
+    def generate_image(self, prompt, api_key, model, aspect_ratio, temperature, seed=66666666, images=None):
+        self._reset_logs()
+        resp_text = ""
 
-        self.log("Warning: No valid API key provided.")
-        return ""
-
-    def generate_empty_image(self, width=512, height=512):
-        """Generates a standard format empty RGB image tensor."""
-        empty_image = np.ones((height, width, 3), dtype=np.float32) * 0.2
-        tensor = torch.from_numpy(empty_image).unsqueeze(0)
-        self.log(f"Creating ComfyUI-compatible empty image: Shape={tensor.shape}, Type={tensor.dtype}")
-        return tensor
-
-    def determine_dimensions_from_aspect_ratio(self, aspect_ratio):
-        """Determina las dimensiones basadas en el aspect ratio seleccionado."""
-        if "Free" in aspect_ratio:
-            # Dimensiones libres, usa valores por defecto
-            return 1024, 1024
-        elif "Landscape" in aspect_ratio:
-            # Horizontal - más ancho que alto
-            return 1344, 768
-        elif "Portrait" in aspect_ratio:
-            # Vertical - más alto que ancho  
-            return 768, 1344
-        elif "Square" in aspect_ratio:
-            # Cuadrado
-            return 1024, 1024
-        else:
-            # Por defecto
-            return 1024, 1024
-
-    def generate_image(self, prompt, api_key, model, aspect_ratio, seed=0, images=None):
-        self.log_messages = []
-        response_text = ""
-        
-        width, height = self.determine_dimensions_from_aspect_ratio(aspect_ratio)
-        generated_image_tensor = self.generate_empty_image(width, height)
-
-        try:
-            actual_api_key = self.get_api_key(api_key)
-            if not actual_api_key:
-                error_message = "Error: No API Key provided."
-                self.log(error_message)
-                return (generated_image_tensor, error_message)
-
-            # 1. Configurar la API con la clave (¡Mucho más simple!)
-            self.log("Configuring Google GenAI with API Key...")
-            genai.configure(api_key=actual_api_key)
-
-            # 2. Crear una instancia del modelo generativo
-            # Nota: El modelo de imagen puede no usar todos los parámetros como seed o aspect_ratio
-            self.log(f"Creating instance of model: {model}")
-            model_instance = genai.GenerativeModel(model)
-
-            # 3. Llamar a la API para generar la imagen
-            self.log(f"Sending prompt to generate image...")
-            # Usamos una configuración para pedir explícitamente una imagen
-            generation_config = genai.types.GenerationConfig(
-                response_mime_type="image/png"
+        # 1) API key
+        resolved_key = _resolve_api_key(api_key, self.logs)
+        if not resolved_key:
+            err = (
+                "错误: 未提供有效的API密钥。\n"
+                "请在节点中输入API密钥，或将其保存到 gemini_api_key.txt，"
+                "或设置变量 de entorno GEMINI_API_KEY。"
             )
-            response = model_instance.generate_content(prompt, generation_config=generation_config)
-            
-            self.log("Response received from API.")
-            
-            # 4. Procesar la respuesta para extraer los datos de la imagen
-            image_data = None
-            if response.parts and response.parts[0].inline_data:
-                image_part = response.parts[0]
-                if image_part.inline_data.mime_type.startswith("image/"):
-                    image_data = image_part.inline_data.data
-                    response_text += "Image data received successfully from GenAI API.\n"
-                    self.log("Image data extracted from response.")
+            self._log(err)
+            # Retorna una imagen vacía estándar (gris) para no romper grafos
+            empty = np.ones((512, 512, 3), dtype=np.float32) * 0.2
+            return (torch.from_numpy(empty).unsqueeze(0), "## 日志\n" + "\n".join(self.logs))
 
-            if image_data:
-                pil_image = Image.open(io.BytesIO(image_data))
-                if pil_image.mode != 'RGB':
-                    pil_image = pil_image.convert('RGB')
-                img_array = np.array(pil_image).astype(np.float32) / 255.0
-                generated_image_tensor = torch.from_numpy(img_array).unsqueeze(0)
+        client = genai.Client(api_key=resolved_key)
+
+        # 2) Prompt + hints
+        ar_hint = _hint_from_aspect_ratio(aspect_ratio)
+        full_prompt = prompt if not ar_hint else f"{ar_hint} Create a detailed image of: {prompt}"
+
+        # 3) Config
+        gen_config = types.GenerateContentConfig(
+            temperature=float(temperature),
+            seed=int(seed) if isinstance(seed, (int, np.integer)) else 66666666,
+            response_modalities=["Image", "Text"],
+        )
+        self._log(f"[INFO] 使用模型: {model}")
+        self._log(f"[INFO] 温度: {temperature} | 种子: {gen_config.seed}")
+
+        # 4) Contenido (texto + imágenes de referencia opcionales)
+        contents = [{"text": full_prompt}]
+        ref_count = 0
+        if images is not None:
+            try:
+                batch = images.shape[0]
+                self._log(f"[INFO] 检测到参考图像数量: {batch}")
+                for i in range(batch):
+                    # ComfyUI: [B, H, W, 3] float32 [0..1]
+                    arr = images[i].cpu().numpy()
+                    arr = np.clip(arr * 255.0, 0, 255).astype(np.uint8)
+                    pil = Image.fromarray(arr)
+                    buf = BytesIO()
+                    pil.save(buf, format="PNG")
+                    img_bytes = buf.getvalue()
+                    contents.append({"inline_data": {"mime_type": "image/png", "data": img_bytes}})
+                    ref_count += 1
+            except Exception as e:
+                self._log(f"[WARN] 参考图像处理失败: {e}")
+
+        if ref_count > 0:
+            contents[0]["text"] += f" Use {ref_count} reference image(s) as guidance."
+
+        # 5) Llamada a la API (no stream: respuestas más simples de manejar en nodos)
+        try:
+            response = client.models.generate_content(
+                model=model,
+                contents=contents,
+                config=gen_config,
+            )
+        except Exception as api_err:
+            self._log(f"[ERROR] API 调用失败: {api_err}")
+            empty = np.ones((512, 512, 3), dtype=np.float32) * 0.2
+            return (torch.from_numpy(empty).unsqueeze(0), "## 日志\n" + "\n".join(self.logs))
+
+        # 6) Parsear respuesta (texto + primera imagen disponible)
+        out_tensor = None
+        try:
+            if not getattr(response, "candidates", None):
+                self._log("[WARN] API响应中没有candidates")
             else:
-                error_message = "Error: The API response did not contain valid image data."
-                # A veces, si hay un error de seguridad, la respuesta viene en `response.text`
-                if hasattr(response, 'text'):
-                    error_message += f" API Text Response: {response.text}"
-                self.log(error_message)
-                response_text += error_message
+                parts = getattr(response.candidates[0].content, "parts", []) or []
+                for p in parts:
+                    if getattr(p, "text", None):
+                        resp_text += p.text
+                    elif getattr(p, "inline_data", None):
+                        try:
+                            img_bytes = _bytes_from_inline_data(p.inline_data, self.logs)
+                            pil_img = Image.open(BytesIO(img_bytes))
+                            out_tensor = _tensor_from_pil(pil_img, self.logs)
+                            # En caso de múltiples imágenes, nos quedamos con la primera válida
+                            break
+                        except Exception as img_err:
+                            self._log(f"[WARN] 解析图像失败: {img_err}")
 
-        except Exception as e:
-            error_message = f"An unexpected error occurred: {e}"
-            self.log(error_message)
+            if out_tensor is None:
+                # No hubo imagen, devolvemos un lienzo vacío para no romper el flujo
+                self._log("[INFO] API未返回图像，返回空图像")
+                empty = np.ones((512, 512, 3), dtype=np.float32) * 0.2
+                out_tensor = torch.from_numpy(empty).unsqueeze(0)
+
+        except Exception as parse_err:
+            self._log(f"[ERROR] 响应解析错误: {parse_err}")
             traceback.print_exc()
-            response_text += f"Error: {e}\n"
+            empty = np.ones((512, 512, 3), dtype=np.float32) * 0.2
+            out_tensor = torch.from_numpy(empty).unsqueeze(0)
 
-        full_log = "## Log de Procesamiento\n" + "\n".join(self.log_messages) + "\n\n## Respuesta de la API\n" + response_text
-        return (generated_image_tensor, full_log)
+        # 7) Construir texto de salida (logs + texto del modelo)
+        full_text = "## 处理日志\n" + "\n".join(self.logs)
+        if resp_text.strip():
+            full_text += "\n\n## API返回\n" + resp_text
 
-# Register the node
+        return (out_tensor, full_text)
+
+
+# 注册节点
 NODE_CLASS_MAPPINGS = {
-    "NanoBanana_ImageGenerator": NanoBananaImageGenerator
+    "Google-Gemini": GeminiImageGenerator
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "NanoBanana_ImageGenerator": "NanoBanana Image Generator"
+    "Google-Gemini": "Gemini 2.0 image"
 }
