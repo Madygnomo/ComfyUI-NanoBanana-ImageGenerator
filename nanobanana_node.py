@@ -4,6 +4,7 @@ import json
 import base64
 import torch
 import numpy as np
+import google.generativeai as genai
 from PIL import Image, ImageDraw, ImageFont
 import requests
 import traceback
@@ -100,92 +101,64 @@ class NanoBananaImageGenerator:
             # Por defecto
             return 1024, 1024
 
-    def generate_image(self, prompt, api_key, model, aspect_ratio, seed=66666666, images=None):
-        self.log_messages = []  # Reiniciar logs en cada ejecución
+    def generate_image(self, prompt, api_key, model, aspect_ratio, seed=0, images=None):
+        self.log_messages = []
         response_text = ""
         
-        # Determinar dimensiones para la imagen de placeholder en caso de error
         width, height = self.determine_dimensions_from_aspect_ratio(aspect_ratio)
         generated_image_tensor = self.generate_empty_image(width, height)
 
         try:
             actual_api_key = self.get_api_key(api_key)
             if not actual_api_key:
-                error_message = "Error: No se proporcionó una clave de API válida."
+                error_message = "Error: No API Key provided."
                 self.log(error_message)
                 return (generated_image_tensor, error_message)
 
-            # 1. ID de tu proyecto de Google Cloud
-            project_id = "gen-lang-client-0587771574"
+            # 1. Configurar la API con la clave (¡Mucho más simple!)
+            self.log("Configuring Google GenAI with API Key...")
+            genai.configure(api_key=actual_api_key)
 
-            # Endpoint de la API de Google para generación de imágenes
-            api_endpoint = f"https://us-central1-aiplatform.googleapis.com/v1/projects/{project_id}/locations/us-central1/publishers/google/models/imagegeneration@006:predict"
+            # 2. Crear una instancia del modelo generativo
+            # Nota: El modelo de imagen puede no usar todos los parámetros como seed o aspect_ratio
+            self.log(f"Creating instance of model: {model}")
+            model_instance = genai.GenerativeModel(model)
+
+            # 3. Llamar a la API para generar la imagen
+            self.log(f"Sending prompt to generate image...")
+            # Usamos una configuración para pedir explícitamente una imagen
+            generation_config = genai.types.GenerationConfig(
+                response_mime_type="image/png"
+            )
+            response = model_instance.generate_content(prompt, generation_config=generation_config)
             
-            headers = {
-                "Authorization": f"Bearer {actual_api_key}",
-                "Content-Type": "application/json"
-            }
-
-            # 2. Mapeo para convertir la selección del menú al formato que la API necesita
-            aspect_ratio_api_map = {
-                "Landscape": "16:9",
-                "Portrait": "9:16",
-                "Square": "1:1",
-                "Free": "1:1" # API de Google no tiene libre, se usa 1:1
-            }
-            google_aspect_ratio = aspect_ratio_api_map.get(aspect_ratio, "1:1")
+            self.log("Response received from API.")
             
-            # 3. Payload CORRECTO para la API de Google
-            payload = {
-                "instances": [
-                    {"prompt": prompt}
-                ],
-                "parameters": {
-                    "sampleCount": 1,
-                    "aspectRatio": google_aspect_ratio,
-                    "seed": seed
-                }
-            }
-
-            self.log(f"Enviando solicitud a la API de Google AI: {api_endpoint}")
-            self.log(f"Payload: {json.dumps(payload, indent=2)}")
-
-            # Realizar la llamada a la API
-            api_response = requests.post(api_endpoint, headers=headers, json=payload, timeout=90)
-            api_response.raise_for_status()
-            self.log(f"Respuesta de la API: {api_response.status_code}")
-
-            response_data = api_response.json()
-            
-            # 4. LÓGICA CORREGIDA para procesar la respuesta de Google AI
+            # 4. Procesar la respuesta para extraer los datos de la imagen
             image_data = None
-            if "predictions" in response_data and len(response_data["predictions"]) > 0:
-                image_b64_data = response_data["predictions"][0].get("bytesBase64Encoded")
-                if image_b64_data:
-                    image_data = base64.b64decode(image_b64_data)
-                    response_text += "Imagen recibida exitosamente desde Google AI.\n"
-                    self.log("Imagen decodificada desde base64.")
-            
+            if response.parts and response.parts[0].inline_data:
+                image_part = response.parts[0]
+                if image_part.inline_data.mime_type.startswith("image/"):
+                    image_data = image_part.inline_data.data
+                    response_text += "Image data received successfully from GenAI API.\n"
+                    self.log("Image data extracted from response.")
+
             if image_data:
                 pil_image = Image.open(io.BytesIO(image_data))
                 if pil_image.mode != 'RGB':
                     pil_image = pil_image.convert('RGB')
                 img_array = np.array(pil_image).astype(np.float32) / 255.0
                 generated_image_tensor = torch.from_numpy(img_array).unsqueeze(0)
-                self.log(f"Imagen convertida a tensor: {generated_image_tensor.shape}")
             else:
-                error_message = "Error: La respuesta de la API no contenía datos de imagen válidos."
+                error_message = "Error: The API response did not contain valid image data."
+                # A veces, si hay un error de seguridad, la respuesta viene en `response.text`
+                if hasattr(response, 'text'):
+                    error_message += f" API Text Response: {response.text}"
                 self.log(error_message)
-                response_text += f"{error_message}\nRespuesta completa: {json.dumps(response_data)}"
+                response_text += error_message
 
-        except requests.exceptions.RequestException as req_err:
-            error_message = f"Error en la solicitud a la API: {req_err}"
-            self.log(error_message)
-            if hasattr(req_err, 'response') and req_err.response is not None:
-                self.log(f"Detalle del error de la API: {req_err.response.text}")
-                response_text += f"Detalle del error: {req_err.response.text}\n"
         except Exception as e:
-            error_message = f"Ocurrió un error inesperado: {e}"
+            error_message = f"An unexpected error occurred: {e}"
             self.log(error_message)
             traceback.print_exc()
             response_text += f"Error: {e}\n"
