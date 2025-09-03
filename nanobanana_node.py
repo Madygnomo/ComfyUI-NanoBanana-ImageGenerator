@@ -115,12 +115,8 @@ class NanoBananaImageGenerator:
                 self.log(error_message)
                 return (generated_image_tensor, error_message)
 
-            # 1. ID de tu proyecto de Google Cloud (¡DEBES CAMBIAR ESTO!)
+            # 1. ID de tu proyecto de Google Cloud
             project_id = "gen-lang-client-0587771574"
-            if project_id == "gen-lang-client-0587771574":
-                error_message = "Error: Reemplaza 'TU_PROJECT_ID' en el archivo nanobanana_node.py con tu ID de proyecto de Google Cloud."
-                self.log(error_message)
-                return (generated_image_tensor, error_message)
 
             # Endpoint de la API de Google para generación de imágenes
             api_endpoint = f"https://us-central1-aiplatform.googleapis.com/v1/projects/{project_id}/locations/us-central1/publishers/google/models/imagegeneration@006:predict"
@@ -132,10 +128,10 @@ class NanoBananaImageGenerator:
 
             # 2. Mapeo para convertir la selección del menú al formato que la API necesita
             aspect_ratio_api_map = {
-                "Landscape (横屏)": "16:9",
-                "Portrait (竖屏)": "9:16",
-                "Square (方形)": "1:1",
-                "Free (自由比例)": "1:1" # API de Google no tiene libre, se usa 1:1
+                "Landscape": "16:9",
+                "Portrait": "9:16",
+                "Square": "1:1",
+                "Free": "1:1" # API de Google no tiene libre, se usa 1:1
             }
             google_aspect_ratio = aspect_ratio_api_map.get(aspect_ratio, "1:1")
             
