@@ -1,12 +1,14 @@
 import os
+import base64
 import io
 import json
-import base64
 import torch
 import numpy as np
-import google.generativeai as genai
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
 import requests
+from io import BytesIO
+from google import genai
+from google.genai import types
 import traceback
 
 class NanoBananaImageGenerator:
